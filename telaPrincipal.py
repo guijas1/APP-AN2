@@ -3,6 +3,7 @@ import subprocess
 import threading
 import sys
 import re
+import os
 from datetime import datetime
 
 # ------------------------------
@@ -23,7 +24,20 @@ def is_admin() -> bool:
         return False
 
 
-def run_cmd(cmd: str, use_powershell: bool = False, timeout: int = 120) -> tuple[int, str]:
+def relaunch_as_admin():
+    """Relança o próprio app como Administrador (UAC)."""
+    try:
+        import ctypes
+        if is_admin():
+            return True
+        params = f'"{os.path.abspath(__file__)}"'
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+        return True
+    except Exception:
+        return False
+
+
+def run_cmd(cmd: str, use_powershell: bool = False, timeout: int = 240) -> tuple[int, str]:
     """Executa um comando no Windows e retorna (returncode, saida+erros)."""
     if not is_windows():
         return 1, "Este app foi feito para Windows."
@@ -57,10 +71,10 @@ def timestamp() -> str:
 # ------------------------------
 
 def main(page: ft.Page):
-    page.title = "Suporte N2 - Windows Toolkit (v2)"
+    page.title = "Suporte N2 - Windows Toolkit (v3)"
     page.theme_mode = ft.ThemeMode.LIGHT
-    page.window_min_height = 720
-    page.window_min_width = 1100
+    page.window_min_height = 760
+    page.window_min_width = 1180
 
     admin = is_admin()
 
@@ -86,14 +100,38 @@ def main(page: ft.Page):
     def run_in_thread(fn, *args, **kwargs):
         threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True).start()
 
+    # --- Runner PowerShell com saída em tempo real no "terminal" (log_output)
+    def stream_ps(title: str, ps_cmd: str):
+        def task():
+            append_log(f"Iniciando: {title}")
+            args = [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy","Bypass",
+                "-Command", ps_cmd
+            ]
+            try:
+                proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                if proc.stdout:
+                    for line in proc.stdout:
+                        log_output.value += line
+                        page.update()
+                rc = proc.wait()
+                append_log(f"Finalizado: {title} (ReturnCode={rc})")
+            except Exception as e:
+                append_log(f"Erro no streaming: {e}")
+        run_in_thread(task)
+
     # ------------- Campos de entrada -------------
     host_field = ft.TextField(label="Host/IP", hint_text="ex.: 8.8.8.8 ou dominio.com", width=260)
     port_field = ft.TextField(label="Porta (opcional)", hint_text="ex.: 443", width=120)
     pid_field = ft.TextField(label="PID", hint_text="ex.: 1234", width=120)
     drive_field = ft.TextField(label="Unidade", hint_text="ex.: C:", width=100)
-    folder_field = ft.TextField(label="Pasta", hint_text="ex.: C:\\Users\\Public", width=340)
+    folder_field = ft.TextField(label="Pasta", hint_text="ex.: C:\\Users\\Public", width=360)
     topn_field = ft.TextField(label="Top N", hint_text="ex.: 20", width=100)
     group_field = ft.TextField(label="Grupo local", hint_text='ex.: "Administrators"', width=240)
+    dell_path_field = ft.TextField(label="Dell Command Update (exe)", hint_text=r"ex.: C:\\Program Files\\Dell\\CommandUpdate\\DellCommandUpdate.exe", width=520)
+    profile_script_field = ft.TextField(label="Script Replicação (PS1) — opcional", hint_text=r"ex.: C:\\Temp\\replicar_perfil.ps1", width=520)
 
     admin_badge = ft.Container(
         content=ft.Row([
@@ -218,7 +256,8 @@ def main(page: ft.Page):
 
     def do_chkdsk(e=None):
         drv = (drive_field.value or "").strip() or "C:"
-        run_in_thread(lambda: append_block(f"chkdsk {drv}", run_cmd(f"chkdsk {drv}")[1]))
+        ps = f"chkdsk {drv}"
+        stream_ps(f"CHKDSK {drv} (stream)", ps)
 
     def do_list_large_files(e=None):
         folder = (folder_field.value or "").strip()
@@ -247,15 +286,152 @@ def main(page: ft.Page):
             return append_log("Informe o nome do grupo local (ex.: Administrators).")
         run_in_thread(lambda: append_block(f"Membros do grupo '{grp}'", run_cmd(f'net localgroup "{grp}"')[1]))
 
-    # ------------- Ferramentas rápidas (abrir apps nativos) -------------
-    def open_tool(cmd: str, title: str):
+    # ------------- Quality (ONS) -------------
+    def do_diag_report(e=None):
+        # Streaming no terminal enquanto gera o relatório
+        ps = (
+            "Write-Host 'Coletando informações do sistema...';"
+            "$os = Get-CimInstance Win32_OperatingSystem;"
+            "$cs = Get-CimInstance Win32_ComputerSystem;"
+            "$cpu = Get-CimInstance Win32_Processor;"
+            "$mem = Get-CimInstance Win32_PhysicalMemory;"
+            "$disk = Get-CimInstance Win32_DiskDrive;"
+            "$bios = Get-CimInstance Win32_BIOS;"
+            "Write-Host 'Verificando Secure Boot/TPM...';"
+            "$sb = try { (Confirm-SecureBootUEFI) } catch { 'Desconhecido' };"
+            "$tpm = try { Get-TPM } catch { $null };"
+            "Write-Host 'Montando conteúdo...';"
+            "$lines = @();"
+            "$lines += 'Computador: ' + $cs.Name;"
+            "$lines += 'Fabricante/Modelo: ' + ($cs.Manufacturer + ' / ' + $cs.Model);"
+            "$lines += 'OS: ' + $os.Caption + ' ' + $os.Version;"
+            "$lines += 'BIOS: ' + $bios.SMBIOSBIOSVersion + ' (' + $bios.ReleaseDate + ')';"
+            "$lines += 'CPU: ' + $cpu.Name + ' (' + $cpu.NumberOfCores + 'C/' + $cpu.NumberOfLogicalProcessors + 'T)';"
+            "$lines += 'RAM Total(GB): ' + [math]::Round(($cs.TotalPhysicalMemory/1GB),2);"
+            "$lines += 'Slots RAM: ' + ($mem | Measure-Object).Count;"
+            "$lines += 'SecureBoot: ' + $sb;"
+            "$lines += 'TPM Presente: ' + ([bool]($tpm -ne $null));"
+            "$lines += 'Discos:';"
+            "$disk | ForEach-Object { $lines += ('  - ' + $_.Model + ' | ' + $_.InterfaceType + ' | ' + [math]::Round($_.Size/1GB,2) + ' GB') };"
+            "Write-Host 'Gravando arquivo em C\\Temp...';"
+            "$path = 'C\\Temp'; if(-not (Test-Path $path)){ New-Item -ItemType Directory -Path $path | Out-Null };"
+            "$file = Join-Path $path ('Relatorio_' + (Get-Date -Format yyyyMMdd_HHmmss) + '.txt');"
+            "$lines | Set-Content -Path $file -Encoding UTF8;"
+            "Write-Host ('Relatório salvo em: ' + $file);"
+        )
+        stream_ps("Relatório de Diagnóstico (stream)", ps)
+
+    def do_secure_channel_repair(e=None):
+        # Abre uma janela do PowerShell elevada e interativa para credenciais (sem streaming interno)
+        cmd = (
+            "Start-Process powershell -Verb runAs -ArgumentList "
+            "'-NoProfile -ExecutionPolicy Bypass -Command "
+            "Test-ComputerSecureChannel -Repair -Credential (Get-Credential); Read-Host \"Pressione ENTER para sair\"'"
+        )
+        run_in_thread(lambda: append_block("Reparar Canal Seguro AD", run_cmd(cmd, use_powershell=True)[1]))
+
+    def do_enable_rdp(e=None):
+        # Habilita Área de Trabalho Remota e libera no firewall
+        ps = (
+            "Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' -Name 'fDenyTSConnections' -Value 0; "
+            "Enable-NetFirewallRule -DisplayGroup 'Área de Trabalho Remota'"
+        )
+        stream_ps("Habilitar Área de Trabalho Remota (RDP)", ps)
+
+    def do_windows_features(e=None):
+        run_in_thread(lambda: (subprocess.Popen("optionalfeatures", shell=True), append_log("Recursos do Windows solicitado.")))
+
+    def do_map_network_drive(e=None):
+        run_in_thread(lambda: (subprocess.Popen("rundll32.exe shell32.dll,SHHelpShortcuts_RunDLL Connect", shell=True), append_log("Mapear Unidade de Rede solicitado.")))
+
+    def do_quick_assist(e=None):
+        run_in_thread(lambda: (subprocess.Popen("quickassist", shell=True), append_log("Quick Assist solicitado.")))
+
+    def do_windows_fix_ps1(e=None):
+        path = r"C:\\Temp\\correcao_windows.ps1"
+        if not os.path.exists(path):
+            return append_log(f"Script não encontrado: {path}")
+        # Executa elevado – abrirá outra janela; streaming interno não é possível nessa modalidade
+        cmd = f"Start-Process powershell -Verb runAs -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File \"{path}\"'"
+        run_in_thread(lambda: append_block("Correção do Windows (PS1)", run_cmd(cmd, use_powershell=True)[1]))
+
+    def do_profiles_acl_fix(e=None):
+        def confirmed_run():
+            if not is_admin():
+                append_log("Precisa estar em modo Administrador para essa ação.")
+                return
+            # 1) Reaplicar permissões (stream)
+            ps_perm = (
+                "Write-Host 'Reaplicando permissões em C\\Users (takeown/icacls)...';"
+                "$base='C:\\Users';"
+                "Get-ChildItem $base -Directory | ForEach-Object {"
+                "  try {"
+                "    takeown /F $_.FullName /R /D Y | Out-Null;"
+                "    icacls $_.FullName /grant *S-1-5-32-544:F /T /C | Out-Null;"
+                "    Write-Host ('OK: ' + $_.FullName)"
+                "  } catch { Write-Host ('Falha: ' + $_.FullName) }"
+                "}"
+            )
+            stream_ps("Reaplicar Permissões em Perfis (stream)", ps_perm)
+            # 2) Se houver script de replicação, executar em seguida (stream)
+            p = (profile_script_field.value or "").strip()
+            if p and os.path.exists(p):
+                stream_ps("Executando Script de Replicação", f"-ExecutionPolicy Bypass -File \"{p}\"")
+            elif p:
+                append_log(f"Script informado não encontrado: {p}")
+        # diálogo de confirmação
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Atenção"),
+            content=ft.Text("Esta ação altera permissões em C\\Users e pode executar um script de replicação, se informado."),
+            actions=[
+                ft.TextButton("Cancelar", on_click=lambda e: (setattr(dlg, "open", False), page.update())),
+                ft.TextButton("Continuar (Admin)", on_click=lambda e: (setattr(dlg, "open", False), page.update(), confirmed_run())),
+            ],
+        )
+        page.dialog = dlg
+        dlg.open = True
+        page.update()
+
+    def do_winget_upgrade(e=None):
+        # Saída em tempo real no log_output
+        ps = (
+            "$ErrorActionPreference='SilentlyContinue';"
+            "Write-Host 'Resetando fontes do WinGet...'; winget source reset --force;"
+            "Write-Host 'Atualizando fontes do WinGet...'; winget source update;"
+            "Write-Host 'Atualizando todos os pacotes...'; winget upgrade --all --include-unknown --accept-source-agreements --accept-package-agreements -h 0"
+        )
+        stream_ps("WinGet Upgrade (stream)", ps)
+
+    def do_relaunch_admin(e=None):
+        ok = relaunch_as_admin()
+        if ok:
+            append_log("Solicitada elevação. Se nada acontecer, execute como Administrador.")
+        else:
+            append_log("Falha ao solicitar elevação (UAC).")
+
+    def do_dell_command(e=None):
+        # Tenta caminhos padrão e, se falhar, usa o caminho do campo de texto
+        default_paths = [
+            r"C:\\Program Files\\Dell\\CommandUpdate\\DellCommandUpdate.exe",
+            r"C:\\Program Files (x86)\\Dell\\CommandUpdate\\DellCommandUpdate.exe",
+            r"C:\\Program Files\\Dell\\SupportAssistAgent\\bin\\SupportAssistUI.exe",
+        ]
+        custom_path = (dell_path_field.value or "").strip()
+        candidates = [p for p in default_paths if os.path.exists(p)]
+        if custom_path:
+            candidates.insert(0, custom_path)
+        if not candidates:
+            append_log("Dell Command/SupportAssist não encontrado. Informe o caminho no campo acima.")
+            return
+        path = candidates[0]
         def task():
-            append_log(f"Abrindo {title}...")
+            append_log(f"Abrindo Dell utilitário: {path}")
             try:
-                subprocess.Popen(cmd, shell=True)
-                append_log(f"{title} solicitado.")
+                subprocess.Popen(f'"{path}"', shell=True)
+                append_log("Dell utilitário solicitado.")
             except Exception as e:
-                append_log(f"Falha ao abrir {title}: {e}")
+                append_log(f"Falha ao abrir Dell utilitário: {e}")
         run_in_thread(task)
 
     # ------------- Exportar LOG -------------
@@ -333,13 +509,26 @@ def main(page: ft.Page):
         ], wrap=True, spacing=10),
     ]
 
-    ferramentas_controls = [
+    quality_controls = [
+        ft.Text("Quality (ONS)", weight=ft.FontWeight.BOLD),
+        profile_script_field,
         ft.Row([
-            ft.FilledButton("Ger. de Tarefas", icon=ft.Icons.TASK, on_click=lambda e: open_tool("start taskmgr", "Gerenciador de Tarefas")),
-            ft.FilledButton("Visualizador de Eventos", icon=ft.Icons.EVENT, on_click=lambda e: open_tool("start eventvwr", "Visualizador de Eventos")),
-            ft.FilledButton("Painel de Controle", icon=ft.Icons.SETTINGS, on_click=lambda e: open_tool("start control", "Painel de Controle")),
-            ft.FilledButton("Config. de Rede", icon=ft.Icons.WIFI, on_click=lambda e: open_tool("start ms-settings:network", "Configurações de Rede")),
-            ft.FilledButton("Prompt (Admin)", icon=ft.Icons.TERMINAL, on_click=lambda e: open_tool("start cmd", "Prompt de Comando")),
+            ft.FilledButton("Relatório de Diagnóstico (TXT)", icon=ft.Icons.DESCRIPTION, on_click=do_diag_report),
+            ft.FilledButton("Reparar Canal Seguro AD", icon=ft.Icons.VPN_LOCK, on_click=do_secure_channel_repair),
+            ft.FilledButton("Atualizar Programas (WinGet)", icon=ft.Icons.SYSTEM_UPDATE_ALT, on_click=do_winget_upgrade),
+        ], wrap=True, spacing=10),
+        ft.Row([
+            ft.OutlinedButton("Correção do Windows (PS1)", icon=ft.Icons.BUILD, on_click=do_windows_fix_ps1),
+            ft.OutlinedButton("Reaplicar Permissões (Perfis) + Script", icon=ft.Icons.ADMIN_PANEL_SETTINGS, on_click=do_profiles_acl_fix),
+        ], wrap=True, spacing=10),
+        ft.Row([
+            dell_path_field,
+            ft.OutlinedButton("Abrir Dell Command/SupportAssist", icon=ft.Icons.DEVICE_HUB, on_click=do_dell_command),
+            ft.OutlinedButton("Habilitar RDP (Win 10/11)", icon=ft.Icons.DESKTOP_WINDOWS, on_click=do_enable_rdp),
+            ft.OutlinedButton("Recursos do Windows", icon=ft.Icons.EXTENSION, on_click=do_windows_features),
+            ft.OutlinedButton("Mapear Unidade de Rede", icon=ft.Icons.DRIVE_FILE_MOVE, on_click=do_map_network_drive),
+            ft.OutlinedButton("Quick Assist", icon=ft.Icons.SUPPORT_AGENT, on_click=do_quick_assist),
+            ft.OutlinedButton("Reiniciar como Admin", icon=ft.Icons.SECURITY, on_click=do_relaunch_admin),
         ], wrap=True, spacing=10),
     ]
 
@@ -354,7 +543,7 @@ def main(page: ft.Page):
             "Processos": processos_controls,
             "Disco": disco_controls,
             "Usuários": usuarios_controls,
-            "Ferramentas": ferramentas_controls,
+            "Quality (ONS)": quality_controls,
         }
         if section in mapping:
             content_view.controls = [header] + mapping[section] + [ft.Divider(), ft.ElevatedButton("Salvar LOG", icon=ft.Icons.SAVE, on_click=save_log), log_output]
@@ -375,9 +564,9 @@ def main(page: ft.Page):
             ft.NavigationRailDestination(icon=ft.Icons.MEMORY, label="Processos"),
             ft.NavigationRailDestination(icon=ft.Icons.STORAGE, label="Disco"),
             ft.NavigationRailDestination(icon=ft.Icons.PEOPLE, label="Usuários"),
-            ft.NavigationRailDestination(icon=ft.Icons.BUILD_CIRCLE, label="Ferramentas"),
+            ft.NavigationRailDestination(icon=ft.Icons.FACT_CHECK, label="Quality (ONS)"),
         ],
-        on_change=lambda e: set_section(["Rede", "Sistema", "Processos", "Disco", "Usuários", "Ferramentas"][e.control.selected_index]),
+        on_change=lambda e: set_section(["Rede", "Sistema", "Processos", "Disco", "Usuários", "Quality (ONS)"][e.control.selected_index]),
     )
 
     # Inicializa na seção Rede
