@@ -1,0 +1,10 @@
+# Ignorar tudo dentro de dist exceto arquivos .exe
+dist/*
+!dist.exe
+dist
+# Ignorar build do PyInstaller
+build/
+*.spec
+__pycache__/
+*.pyc
+*.ico
