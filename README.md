@@ -44,7 +44,7 @@ Aplicação em **Python + Flet** para execução rápida de comandos comuns no W
 ## 📂 Estrutura do projeto
 
 ```
-├── app.py               # Código principal
+├── TelaPrincipal.py               # Código principal
 ├── requirements.txt     # Dependências
 └── README.md            # Este arquivo
 ```
